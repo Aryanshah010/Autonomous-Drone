@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tello Video Stream</title>
+</head>
+<body>
+  <h1>Tello Video Stream</h1>
+  <img id="videoFrame" width="640" height="360">
+  <p id="detections">Detections: None</p>
+  <script>
+    const ws = new WebSocket('ws://<LAPTOP_IP>:8765');
+    const img = document.getElementById('videoFrame');
+    const det = document.getElementById('detections');
+    ws.onmessage = function(event) {
+      const data = eval('(' + event.data + ')'); // Simple parsing
+      img.src = 'data:image/jpeg;base64,' + data.frame;
+      det.textContent = 'Detections: ' + data.detections.join(', ');
+    };
+    ws.onclose = function() { det.textContent = 'Connection closed'; };
+    ws.onerror = function(error) { det.textContent = 'Error: ' + error; };
+  </script>
+</body>
+</html>

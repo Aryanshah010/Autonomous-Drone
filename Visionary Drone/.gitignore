@@ -1,0 +1,7 @@
+layout.txt
+
+__pycache__
+*.pyc   
+
+# Python virtual environment
+.venv/

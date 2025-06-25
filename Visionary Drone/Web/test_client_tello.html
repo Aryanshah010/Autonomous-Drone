@@ -1,0 +1,21 @@
+#For tello_test_stream.py
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tello Video Stream</title>
+</head>
+<body>
+  <h1>Tello Video Stream</h1>
+  <img id="videoFrame" width="640" height="360">
+  <script>
+    const ws = new WebSocket('ws://<LAPTOP_IP>:8769');
+    const img = document.getElementById('videoFrame');
+    ws.onmessage = function(event) {
+      img.src = 'data:image/jpeg;base64,' + event.data;
+    };
+    ws.onclose = function() { img.alt = 'Connection closed'; };
+    ws.onerror = function(error) { img.alt = 'Error: ' + error; };
+  </script>
+</body>
+</html>

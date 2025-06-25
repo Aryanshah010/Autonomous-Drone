@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tello Stream</title>
+</head>
+<body>
+  <h1>Tello Stream</h1>
+  <img id="videoFrame" width="640" height="360">
+  <p id="detections">Data: None</p>
+  <script>
+    const ws = new WebSocket('ws://<LAPTOP_IP>:<PORT>'); // 8765, 8766, 8767, or 8768  
+    // Ports: 8765 (config), 8766 (drone), 8767 (video), 8768 (detection)
+    const img = document.getElementById('videoFrame');
+    const det = document.getElementById('detections');
+    ws.onmessage = function(event) {
+      const data = JSON.parse(event.data);
+      if (data.frame) {
+        img.src = 'data:image/jpeg;base64,' + data.frame;
+        det.textContent = 'Data: ' + (data.detections ? data.detections.join(', ') : JSON.stringify(data));
+      } else {
+        det.textContent = 'Data: ' + JSON.stringify(data);
+      }
+    };
+    // Example commands
+    // ws.send(JSON.stringify({"command": "check_config"})); // For 8765
+    // ws.send(JSON.stringify({"command": "takeoff"}));     // For 8766, 8767, 8768
+  </script>
+</body>
+</html>

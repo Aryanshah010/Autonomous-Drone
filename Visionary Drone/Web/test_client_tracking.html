@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tello Tracking Stream</title>
+</head>
+<body>
+  <h1>Tello Tracking Stream</h1>
+  <img id="videoFrame" width="640" height="360">
+  <p id="detections">Data: None</p>
+  <script>
+    const ws = new WebSocket('ws://<LAPTOP_IP>:8770');
+    const img = document.getElementById('videoFrame');
+    const det = document.getElementById('detections');
+    ws.onmessage = function(event) {
+      const data = JSON.parse(event.data);
+      if (data.frame) {
+        img.src = 'data:image/jpeg;base64,' + data.frame;
+        det.textContent = 'Data: ' + (data.detections ? data.detections.join(', ') + (data.track_id ? `, ID: ${data.track_id}` : '') : JSON.stringify(data));
+      } else {
+        det.textContent = 'Data: ' + JSON.stringify(data);
+      }
+    };
+    ws.onclose = function() { det.textContent = 'Connection closed'; };
+    ws.onerror = function(error) { det.textContent = 'Error: ' + error; };
+    // Example: ws.send(JSON.stringify({"command": "takeoff"}));
+  </script>
+</body>
+</html>

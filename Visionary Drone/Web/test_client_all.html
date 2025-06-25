@@ -1,29 +1,46 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Tello Stream</title>
+  <title>Tello Stream Client</title>
 </head>
 <body>
-  <h1>Tello Stream</h1>
+  <h1>Tello Stream Client</h1>
+  <select id="portSelect">
+    <option value="8765">Config (8765)</option>
+    <option value="8766">Drone (8766)</option>
+    <option value="8767">Video (8767)</option>
+    <option value="8768">Object Detection (8768)</option>
+    <option value="8769">Tello Simplified (8769)</option>
+    <option value="8770">Tracking (8770)</option>
+  </select>
+  <button onclick="connectWebSocket()">Connect</button>
   <img id="videoFrame" width="640" height="360">
   <p id="detections">Data: None</p>
   <script>
-    const ws = new WebSocket('ws://<LAPTOP_IP>:<PORT>'); // 8765, 8766, 8767, or 8768  
-    // Ports: 8765 (config), 8766 (drone), 8767 (video), 8768 (detection)
-    const img = document.getElementById('videoFrame');
-    const det = document.getElementById('detections');
-    ws.onmessage = function(event) {
-      const data = JSON.parse(event.data);
-      if (data.frame) {
-        img.src = 'data:image/jpeg;base64,' + data.frame;
-        det.textContent = 'Data: ' + (data.detections ? data.detections.join(', ') : JSON.stringify(data));
-      } else {
-        det.textContent = 'Data: ' + JSON.stringify(data);
-      }
-    };
-    // Example commands
-    // ws.send(JSON.stringify({"command": "check_config"})); // For 8765
-    // ws.send(JSON.stringify({"command": "takeoff"}));     // For 8766, 8767, 8768
+    let ws;
+    function connectWebSocket() {
+      const port = document.getElementById('portSelect').value;
+      if (ws) ws.close();
+      ws = new WebSocket(`ws://<LAPTOP_IP>:${port}`);
+      const img = document.getElementById('videoFrame');
+      const det = document.getElementById('detections');
+      ws.onmessage = function(event) {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.frame) {
+            img.src = 'data:image/jpeg;base64,' + data.frame;
+            det.textContent = 'Data: ' + (data.detections ? data.detections.join(', ') + (data.track_id ? `, ID: ${data.track_id}` : '') : JSON.stringify(data));
+          } else {
+            det.textContent = 'Data: ' + JSON.stringify(data);
+          }
+        } catch {
+          img.src = 'data:image/jpeg;base64,' + event.data;
+          det.textContent = 'Data: Video frame';
+        }
+      };
+      ws.onclose = function() { det.textContent = 'Connection closed'; };
+      ws.onerror = function(error) { det.textContent = 'Error: ' + error; };
+    }
   </script>
 </body>
 </html>

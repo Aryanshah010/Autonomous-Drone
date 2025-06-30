@@ -1,6 +1,5 @@
 import cv2
 import config
-from drone_controller import DroneController
 import time
 
 class VideoProcessor:
@@ -10,7 +9,7 @@ class VideoProcessor:
         self.video_capture = None
         self.streaming = False
         self.last_frame_time = 0
-        self.frame_interval = 1 / 5  # Process at 15 FPS to reduce load
+        self.frame_interval = 1 / 15  # Process at 15 FPS to reduce load
 
     def start_stream(self, retries=3, delay=2):
         """Start the drone's video stream with retries."""

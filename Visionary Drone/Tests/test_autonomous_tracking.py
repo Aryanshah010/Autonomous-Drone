@@ -20,9 +20,9 @@ def main():
         controller.disconnect()
         sys.exit(1)
     
-    status_thread = threading.Thread(target=controller.monitor_status, args=(5,))
-    status_thread.daemon = True
-    status_thread.start()
+    # status_thread = threading.Thread(target=controller.monitor_status, args=(5,))
+    # status_thread.daemon = True
+    # status_thread.start()
     
     video_processor = VideoProcessor(controller)
     detector = ObjectDetector()
@@ -41,6 +41,7 @@ def main():
         controller.land()
         controller.disconnect()
         sys.exit(1)
+    
     
     print("Tracking objects for 10 seconds. Press 'q' to stop early.")
     start_time = time.time()
@@ -69,11 +70,11 @@ def main():
     except KeyboardInterrupt:
         print("User interrupted, landing drone")
     
-    time.sleep(1)
-    controller.tello.send_rc_control(0, 0, 0, 0)
-    if not controller.land():
-        print("Landing failed, attempting emergency stop")
-        controller.emergency_stop()
+    # time.sleep(1)
+    # controller.tello.send_rc_control(0, 0, 0, 0)
+    # if not controller.land():
+    #     print("Landing failed, attempting emergency stop")
+    #     controller.emergency_stop()
     
     video_processor.stop_stream()
     controller.get_battery()

@@ -11,7 +11,7 @@ FRAME_RATE = 30  # Frames per second for video processing
 RESOLUTION = (1280, 720)  # Tello's default video resolution (720p)
 
 # YOLOv8 model settings
-MODEL_PATH = "models/yolov8n.pt"  # Path to YOLOv8 nano model
+MODEL_PATH = "models/yolov8m.pt"  # Path to YOLOv8 nano model
 CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence for detections (0 to 1)
 
 # Deep SORT tracking settings

@@ -25,9 +25,11 @@ class DeepSortTracker:
         output = kp * error + ki * integral + kd * derivative
         return output, integral
 
-    def track_object(self, detections, controller, frame):
+    def track_object(self, detections, controller, frame, return_bbox=False):
         if not detections or not any(d["label"].startswith("person") for d in detections):
             controller.tello.send_rc_control(0, 0, 0, 0)
+            if return_bbox:
+                return False, None, None
             return False, None
 
         # Format detections for Deep SORT: [[x1,y1,x2,y2,confidence], ...]
@@ -42,12 +44,16 @@ class DeepSortTracker:
         tracks = self.tracker.update_tracks(deepsort_detections, frame=frame)
         if not tracks:
             controller.tello.send_rc_control(0, 0, 0, 0)
+            if return_bbox:
+                return False, None, None
             return False, None
 
         # Select track with highest confidence
         person_track = max(tracks, key=lambda t: t.det_conf if t.det_conf else 0)
         if not person_track.is_confirmed() or person_track.det_class != 0:
             controller.tello.send_rc_control(0, 0, 0, 0)
+            if return_bbox:
+                return False, None, None
             return False, None
 
         # Get bounding box
@@ -77,4 +83,6 @@ class DeepSortTracker:
 
         # Send control command
         controller.tello.send_rc_control(0, forward_velocity, 0, yaw_velocity)
+        if return_bbox:
+            return True, track_id, [int(x1), int(y1), int(w), int(h)]
         return True, track_id

@@ -8,15 +8,15 @@ STATE_PORT = 8890  # UDP port for receiving drone status (e.g., battery)
 
 # Video stream settings
 FRAME_RATE = 30  # Frames per second for video processing
-RESOLUTION = (1280, 720)  # Tello's default video resolution (720p)
+RESOLUTION = (960, 720)  # Tello's default video resolution (720p)
 
 # YOLOv8 model settings
-MODEL_PATH = "models/yolov8m.pt"  # Path to YOLOv8 nano model
+MODEL_PATH = "/Users/aryanshah/Developer/Autonomous-Drone/Visionary Drone/models/yolo11m-pose.pt"  # Path to YOLOv8 nano model
 CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence for detections (0 to 1)
 
 # Deep SORT tracking settings
 DEEP_SORT_MAX_AGE = 30  # Max frames to track an object after it's lost
-DEEP_SORT_IOU_THRESHOLD = 0.7  # Intersection-over-Union threshold for associating detections
+DEEP_SORT_IOU_THRESHOLD = 2  # Intersection-over-Union threshold for associating detections
 
 # PID controller gains for autonomous movement
 PID_GAINS = {
@@ -26,4 +26,4 @@ PID_GAINS = {
 }
 
 # Debugging settings
-DEBUG = True  # Enable/disable video display and logging
+DEBUG = False  # Enable/disable video display and logging

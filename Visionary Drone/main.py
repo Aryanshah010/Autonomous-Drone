@@ -1,641 +1,378 @@
 import cv2
-import time
-import threading
-import av
 import numpy as np
 from djitellopy import Tello
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
-import config
-from collections import deque
-from cinematic_shots.DroneAI import DroneAI
-import logging
+import time
 
-# Set up logging for better error tracking
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
+# ----------------------------
+# Configuration Parameters
+# ----------------------------
+POSE_MODEL = '/Users/aryanshah/Developer/Autonomous-Drone/Visionary Drone/models/yolo11m-pose.pt'
+MAX_FPS = 30
+TARGET_AREA = 0.12  # Reduced target area for better distance control
+AREA_THRESHOLD = 0.01  # Reduced threshold for more sensitive response
+DEADZONE_PIX = 25
+MAX_SPEED = 50
 
-# Set up the video stream URL from the drone
-device_url = f"udp://@0.0.0.0:{config.VIDEO_PORT}"
+# PID Gains - Adjusted for better forward/backward control
+KP_YAW = 0.6
+KP_FB = 1.5   # Increased for more responsive forward/backward
+KP_UD = 0.5
+KP_LR = 0.6
 
-# Threaded frame grabber for low-latency video
-class FrameGrabber(threading.Thread):
-    def __init__(self):
-        super().__init__()
-        self.container = None
-        self.frame = None
-        self.lock = threading.Lock()
-        self.stopped = False
-        self.connection_attempts = 0
-        self.max_connection_attempts = 5
-        self.fallback_frame = None
-        self.last_frame_time = 0
-        self.frame_timeout = 5.0  # 5 seconds timeout
+# Tracking parameters
+MAX_LOST_FRAMES = 60
+REACQUISITION_DISTANCE = 400
+HEADING_HISTORY_SIZE = 5
 
-    def optimize_for_tello():
-        """Optimize processing for Tello's capabilities"""
-        # Reduce processing frequency
-        PROCESSING_INTERVAL = 0.1  # Process every 100ms instead of every frame
-        
-        # Reduce YOLO confidence for faster processing
-        config.CONFIDENCE_THRESHOLD = 0.6  # Higher threshold = fewer detections
-        
-        # Limit tracking database size
-        MAX_APPEARANCE_DB_SIZE = 20  # Reduced from 50
+# Movement detection parameters
+MOVEMENT_THRESHOLD = 15
+HOVER_TIMEOUT = 2.0
 
+# Obstacle detection parameters
+OBSTACLE_REGION = (slice(200, 280), slice(280, 360))
+OBSTACLE_THRESHOLD = 50
 
-    def initialize_stream(self):
-        """Initialize video stream with error handling"""
-        try:
-            # Close existing container if any
-            if self.container:
-                try:
-                    self.container.close()
-                except:
-                    pass
-                    
-            self.container = av.open(device_url, timeout=10.0, options={
-                'rtsp_transport': 'udp',
-                'stimeout': '5000000',  # 5 second timeout
-                'fflags': 'nobuffer',
-                'flags': 'low_delay'
-            })
-            logger.info("Video stream initialized successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to initialize video stream: {e}")
-            return False
+# ----------------------------
+# Helper Functions
+# ----------------------------
 
-    def run(self):
-        while not self.stopped and self.connection_attempts < self.max_connection_attempts:
-            if not self.initialize_stream():
-                self.connection_attempts += 1
-                time.sleep(2)
-                continue
-
-            try:
-                for packet in self.container.demux(video=0):
-                    if self.stopped:
-                        break
-                        
-                    try:
-                        for frame in packet.decode():
-                            if frame is None:
-                                continue
-                            try:
-                                img = frame.to_ndarray(format='bgr24')
-                                if img is not None and img.size > 0:
-                                    with self.lock:
-                                        self.frame = img
-                                        self.last_frame_time = time.time()
-                                        # Store a fallback frame
-                                        if self.fallback_frame is None:
-                                            self.fallback_frame = img.copy()
-                                else:
-                                    logger.warning("Received empty or invalid frame")
-                            except Exception as e:
-                                logger.error(f"Frame conversion error: {e}")
-                                # Use fallback frame if available
-                                if self.fallback_frame is not None:
-                                    with self.lock:
-                                        self.frame = self.fallback_frame.copy()
-                    except Exception as e:
-                        logger.warning(f"Packet decode error: {e}")
-                        continue
-                        
-            except Exception as e:
-                logger.error(f"Stream error: {e}")
-                self.connection_attempts += 1
-                time.sleep(1)
-                continue
-
-        logger.warning("Frame grabber stopped")
-
-    def get_frame(self):
-        """Thread-safe frame retrieval with error handling"""
-        with self.lock:
-            current_time = time.time()
-            
-            # Check if frame is too old
-            if self.frame is not None and (current_time - self.last_frame_time) > self.frame_timeout:
-                logger.warning("Frame is too old, using fallback")
-                self.frame = self.fallback_frame.copy() if self.fallback_frame is not None else None
-            
-            if self.frame is not None:
-                try:
-                    return self.frame.copy()
-                except Exception as e:
-                    logger.error(f"Frame copy error: {e}")
-                    return self.fallback_frame.copy() if self.fallback_frame is not None else None
-            return self.fallback_frame.copy() if self.fallback_frame is not None else None
-
-    def stop(self):
-        self.stopped = True
-        try:
-            if self.container:
-                self.container.close()
-        except Exception as e:
-            logger.error(f"Error closing container: {e}")
-
-# Appearance database for re-identification with memory management
-appearance_db = {}  # track_id: histogram
-MAX_APPEARANCE_DB_SIZE = 50  # Prevent memory leaks
-
-def manage_appearance_db():
-    """Manage appearance database size to prevent memory leaks"""
-    if len(appearance_db) > MAX_APPEARANCE_DB_SIZE:
-        logger.info(f"Clearing appearance database (size: {len(appearance_db)})")
-        appearance_db.clear()
-
-
-# Add these utility functions at the top of main.py
-
-def safe_zip_detections(boxes, confidences):
-    """Safely zip detection boxes and confidences"""
-    try:
-        if boxes is None or confidences is None:
-            return []
-        min_len = min(len(boxes), len(confidences))
-        return list(zip(boxes[:min_len], confidences[:min_len]))
-    except Exception as e:
-        logger.error(f"Safe zip detections error: {e}")
-        return []
-
-def safe_zip_tracks_keypoints(tracks, keypoints_all):
-    """Safely zip tracks and keypoints"""
-    try:
-        if tracks is None or keypoints_all is None:
-            return []
-        min_len = min(len(tracks), len(keypoints_all))
-        return list(zip(tracks[:min_len], keypoints_all[:min_len]))
-    except Exception as e:
-        logger.error(f"Safe zip tracks keypoints error: {e}")
-        return []
-
-def safe_mean(values):
-    """Calculate mean safely for potentially empty lists"""
-    try:
-        if not values:
-            return 0.0
-        result = np.mean(values)
-        return 0.0 if np.isnan(result) or np.isinf(result) else result
-    except Exception as e:
-        logger.error(f"Safe mean calculation error: {e}")
-        return 0.0
+def calculate_person_heading(keypoints):
+    """Calculate the heading direction of a person based on keypoints"""
+    if keypoints is None or len(keypoints) < 13:
+        return None, 0, 0
     
-# Extract color histogram from a bounding box region
-def extract_histogram(image, bbox):
-    """Extract histogram with comprehensive error handling"""
     try:
-        if image is None or image.size == 0:
-            logger.warning("Invalid image provided for histogram extraction")
-            return None
-
-        x1, y1, x2, y2 = map(int, bbox)
-        h, w = image.shape[:2]
+        nose = keypoints[0]
+        left_shoulder = keypoints[5]
+        right_shoulder = keypoints[6]
+        left_hip = keypoints[11]
+        right_hip = keypoints[12]
         
-        # Validate frame dimensions
-        if w <= 0 or h <= 0:
-            logger.error(f"Invalid frame dimensions: {w}x{h}")
-            return None
-
-        # Clamp coordinates to valid range
-        x1 = max(0, min(x1, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        x2 = max(x1 + 1, min(x2, w))
-        y2 = max(y1 + 1, min(y2, h))
+        if (len(nose) < 3 or len(left_shoulder) < 3 or len(right_shoulder) < 3 or
+            len(left_hip) < 3 or len(right_hip) < 3):
+            return None, 0, 0
         
-        # Validate crop region
-        if x2 <= x1 or y2 <= y1:
-            logger.warning(f"Invalid crop region: {bbox}")
-            return None
-
-        crop = image[y1:y2, x1:x2]
-        if crop.size == 0:
-            logger.warning(f"Empty crop at {bbox}, skipping histogram.")
-            return None
-
-        # Convert to HSV and calculate histogram
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
-        normalized_hist = cv2.normalize(hist, hist).flatten()
+        if (nose[2] < 0.3 or left_shoulder[2] < 0.3 or right_shoulder[2] < 0.3 or
+            left_hip[2] < 0.3 or right_hip[2] < 0.3):
+            return None, 0, 0
         
-        # Validate histogram
-        if np.any(np.isnan(normalized_hist)) or np.any(np.isinf(normalized_hist)):
-            logger.warning("Invalid histogram values detected")
-            return None
-            
-        return normalized_hist
-
-    except Exception as e:
-        logger.error(f"Histogram extraction error: {e}")
-        return None
-
-# Match a histogram to the appearance database
-def match_histogram(hist, db, threshold=0.5):
-    """Match histogram with error handling"""
-    try:
-        if hist is None or db is None or len(db) == 0:
-            return None
-
-        best_id, best_score = None, float('inf')
-        for tid, ref_hist in db.items():
-            try:
-                score = cv2.compareHist(hist, ref_hist, cv2.HISTCMP_BHATTACHARYYA)
-                if not np.isnan(score) and not np.isinf(score):
-                    if score < threshold and score < best_score:
-                        best_score, best_id = score, tid
-            except Exception as e:
-                logger.warning(f"Histogram comparison error for ID {tid}: {e}")
-                continue
-                
-        return best_id
-    except Exception as e:
-        logger.error(f"Histogram matching error: {e}")
-        return None
-
-# Detect crossed hands gesture using keypoints with validation
-def is_crossed(keypoints, dist_thresh=50):
-    """Detect crossed hands gesture with comprehensive validation"""
-    try:
-        if keypoints is None:
-            return False
-
-        # Fix NumPy deprecation warning
-        pts = np.array(keypoints, dtype=np.float64)
+        mid_hip_x = (left_hip[0] + right_hip[0]) / 2
+        mid_hip_y = (left_hip[1] + right_hip[1]) / 2
         
-        # Validate keypoint array
-        if len(pts) < 11:
-            logger.debug("Insufficient keypoints for gesture detection")
-            return False
+        shoulder_center_x = (left_shoulder[0] + right_shoulder[0]) / 2
+        shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
+        
+        heading_x = shoulder_center_x - mid_hip_x
+        heading_y = shoulder_center_y - mid_hip_y
+        
+        heading_angle = np.degrees(np.arctan2(heading_y, heading_x))
+        confidence = (nose[2] + left_shoulder[2] + right_shoulder[2] + left_hip[2] + right_hip[2]) / 5
+        
+        return (heading_x, heading_y), heading_angle, confidence
+        
+    except (IndexError, TypeError, ValueError) as e:
+        return None, 0, 0
 
-        # Check for invalid values
-        if np.any(np.isnan(pts)) or np.any(np.isinf(pts)):
-            logger.warning("Invalid keypoint values detected")
-            return False
-
-        # Check for negative coordinates
-        if np.any(pts < 0):
-            logger.warning("Negative keypoint coordinates detected")
-            return False
-
-        # Extract relevant keypoints (shoulders and wrists)
+def draw_keypoints_and_heading(frame, keypoints, bbox, heading_info):
+    """Draw keypoints and heading direction on the frame"""
+    if keypoints is None or len(keypoints) == 0:
+        return
+    
+    for i, kpt in enumerate(keypoints):
         try:
-            ls, rs = pts[5], pts[6]  # Left and right shoulders
-            lw, rw = pts[9], pts[10]  # Left and right wrists
-        except IndexError as e:
-            logger.error(f"Keypoint index error: {e}")
-            return False
-
-        # Calculate distances with validation
+            if len(kpt) >= 3 and kpt[2] > 0.3:
+                x, y = int(kpt[0]), int(kpt[1])
+                confidence = kpt[2]
+                color = (0, int(255 * confidence), int(255 * (1 - confidence)))
+                cv2.circle(frame, (x, y), 3, color, -1)
+        except (IndexError, TypeError, ValueError):
+            continue
+    
+    if heading_info[0] is not None:
         try:
-            dist1 = np.linalg.norm(lw - rs)
-            dist2 = np.linalg.norm(rw - ls)
+            heading_vector, angle, confidence = heading_info
+            x1, y1, x2, y2 = bbox
             
-            # Validate distance calculations
-            if np.isnan(dist1) or np.isnan(dist2) or np.isinf(dist1) or np.isinf(dist2):
-                logger.warning("Invalid distance calculations")
-                return False
-                
-            return dist1 < dist_thresh and dist2 < dist_thresh
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
             
-        except Exception as e:
-            logger.error(f"Distance calculation error: {e}")
-            return False
+            scale = 50
+            end_x = int(center_x + heading_vector[0] * scale)
+            end_y = int(center_y + heading_vector[1] * scale)
+            
+            cv2.arrowedLine(frame, (center_x, center_y), (end_x, end_y), (0, 255, 255), 3)
+        except (IndexError, TypeError, ValueError):
+            pass
 
-    except Exception as e:
-        logger.error(f"Gesture detection error: {e}")
+def detect_obstacle(frame):
+    """Detect obstacles in front of the drone"""
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        region = gray[OBSTACLE_REGION]
+        avg_brightness = np.mean(region)
+        return avg_brightness < OBSTACLE_THRESHOLD
+    except Exception:
         return False
 
-# Add this function to handle invalid bounding boxes
-def validate_bounding_box(x1, y1, x2, y2, frame_w, frame_h):
-    """Validate and fix bounding box coordinates"""
-    try:
-        # Ensure coordinates are within frame bounds
-        x1 = max(0, min(x1, frame_w - 1))
-        y1 = max(0, min(y1, frame_h - 1))
-        x2 = max(x1 + 1, min(x2, frame_w))
-        y2 = max(y1 + 1, min(y2, frame_h))
-        
-        # Check if box is valid
-        if x2 <= x1 or y2 <= y1:
-            return None, None, None, None
-            
-        return x1, y1, x2, y2
-        
-    except Exception as e:
-        logger.error(f"Bounding box validation error: {e}")
-        return None, None, None, None
-
-def main():
-    """Main function with comprehensive error handling"""
-    tello = None
-    grabber = None
+def detect_movement(current_pos, last_pos, threshold=MOVEMENT_THRESHOLD):
+    """Detect if person has moved significantly"""
+    if last_pos is None:
+        return True
     
     try:
-        # Initialize drone connection
-        tello = Tello()
-        logger.info("Connecting to Tello drone...")
-        
-        try:
-            tello.connect()
-            battery = tello.get_battery()
-            logger.info(f"Battery: {battery}%")
-            
-            if battery < 20:
-                logger.warning("Low battery detected!")
-                
-        except Exception as e:
-            logger.error(f"Failed to connect to drone: {e}")
-            return
+        dx = current_pos[0] - last_pos[0]
+        dy = current_pos[1] - last_pos[1]
+        distance = np.sqrt(dx*dx + dy*dy)
+        return distance > threshold
+    except Exception:
+        return True
 
-        # Start video stream
-        try:
-            tello.streamon()
-            logger.info("Video stream started.")
-        except Exception as e:
-            logger.error(f"Failed to start video stream: {e}")
-            return
+# ----------------------------
+# Main Drone Controller
+# ----------------------------
 
-        # Load YOLO model
-        logger.info("Loading YOLO model...")
-        try:
-            model = YOLO(config.MODEL_PATH)
-            model.classes = [0]
-        except Exception as e:
-            logger.error(f"Failed to load YOLO model: {e}")
-            return
+def initialize_drone_and_models():
+    """Initialize drone connection, video stream, and models"""
+    print("Initializing drone connection...")
+    tello = Tello()
+    tello.connect()
+    time.sleep(1)
+    
+    battery = tello.get_battery()
+    print(f"Battery: {battery}%")
+    
+    if battery < 20:
+        print("Battery too low to take off. Exiting.")
+        return None, None, None, None
+    
+    print("Starting video stream...")
+    tello.streamon()
+    time.sleep(2)
+    
+    cap = tello.get_frame_read()
+    time.sleep(1)
+    
+    # Test video stream
+    print("Testing video stream...")
+    for _ in range(10):
+        frame = cap.frame
+        if frame is not None:
+            h, w, _ = frame.shape
+            print(f"Video stream working - Frame size: {w}x{h}")
+            break
+        time.sleep(0.2)
+    else:
+        print("Failed to get video stream. Exiting.")
+        return None, None, None, None
+    
+    print("Loading YOLO pose model...")
+    try:
+        pose_model = YOLO(POSE_MODEL)
+        time.sleep(1)
+        print("YOLO model loaded successfully")
+    except Exception as e:
+        print(f"Failed to load YOLO model: {e}")
+        return None, None, None, None
+    
+    print("Initializing DeepSort tracker...")
+    try:
+        tracker = DeepSort(max_age=30)
+        time.sleep(0.5)
+        print("DeepSort tracker initialized")
+    except Exception as e:
+        print(f"Failed to initialize DeepSort: {e}")
+        return None, None, None, None
+    
+    return tello, cap, pose_model, tracker
 
-        # Initialize tracking
-        try:
-            deepsort = DeepSort(max_age=50, n_init=3)
-        except Exception as e:
-            logger.error(f"Failed to initialize DeepSORT: {e}")
-            return
-
-        # Initialize frame grabber
-        grabber = FrameGrabber()
-        grabber.start()
-        
-        # Wait for first frame
-        logger.info("Waiting for video stream...")
-        frame = None
-        timeout = 30  # 30 second timeout
-        start_time = time.time()
-        
-        while frame is None and (time.time() - start_time) < timeout:
-            frame = grabber.get_frame()
-            time.sleep(0.1)
-            
-        if frame is None:
-            logger.error("Failed to receive video frame within timeout")
-            return
-
-        # Initialize AI controller
-        frame_h, frame_w = frame.shape[:2]
-        if frame_w <= 0 or frame_h <= 0:
-            logger.error(f"Invalid frame dimensions: {frame_w}x{frame_h}")
-            return
-            
-        ai_controller = DroneAI(tello, (frame_w, frame_h))
-
-        # Initialize tracking state
-        crossed_ids = set()
-        id_mapping = {}
-        following = False
-        target_id = None
-        frame_count = 0
-
-        # Take off
-        logger.info("Taking off...")
-        try:
-            tello.takeoff()
-            logger.info("Drone has taken off. Waiting for crossed hands gesture to start following.")
-        except Exception as e:
-            logger.error(f"Takeoff failed: {e}")
-            return
-        
-        # Main processing loop with Tello optimizations
-        last_processing_time = 0
-        processing_interval = 0.1  # Process every 100ms
-
-        # Main processing loop
-        while True:
+def test_detection_system(pose_model, cap, duration=3):
+    """Test detection system before takeoff"""
+    print("Testing detection system...")
+    start_time = time.time()
+    detection_count = 0
+    total_frames = 0
+    
+    while time.time() - start_time < duration:
+        frame = cap.frame
+        if frame is not None:
+            total_frames += 1
             try:
+                results = pose_model(frame, stream=False)[0]
+                num_people = len(results.boxes) if results.boxes is not None else 0
+                if num_people > 0:
+                    detection_count += 1
+            except Exception:
+                pass
+        
+        time.sleep(0.1)
+    
+    detection_rate = detection_count / max(total_frames, 1)
+    print(f"Detection test complete - Rate: {detection_rate:.2f}")
+    return detection_rate > 0.1
 
-                current_time = time.time()
-                
-                # Check processing interval
-                if current_time - last_processing_time < processing_interval:
-                    time.sleep(0.01)
-                    continue
-                
-                last_processing_time = current_time
+def main():
+    tello, cap, pose_model, tracker = initialize_drone_and_models()
+    if tello is None:
+        print("Initialization failed. Exiting.")
+        return
 
-                frame = grabber.get_frame()
-                if frame is None:
-                    logger.warning("Frame is None. Skipping.")
-                    time.sleep(0.01)
-                    continue
+    if not test_detection_system(pose_model, cap):
+        print("Detection system not working properly. Exiting.")
+        tello.streamoff()
+        return
 
-                frame_count += 1
-                
-                # Process frame with YOLO
-                try:
-                    results = model(frame, conf=config.CONFIDENCE_THRESHOLD, verbose=False)[0]
-                    keypoints_all = results.keypoints.xy if results.keypoints is not None else []
-                except Exception as e:
-                    logger.error(f"YOLO processing error: {e}")
-                    continue
+    print("All systems ready. Taking off...")
+    try:
+        tello.takeoff()
+        time.sleep(3)
+        print("Takeoff complete")
+    except Exception as e:
+        print(f"Takeoff failed: {e}")
+        tello.streamoff()
+        return
 
-                # Prepare detections
-                detections = []
-                try:
-                    safe_detections = safe_zip_detections(results.boxes.xyxy, results.boxes.conf)
-                    for box, conf in safe_detections:
-                        x1, y1, x2, y2 = map(float, box.tolist())
-                        detections.append([[x1, y1, x2, y2], float(conf), "person"])
-                except Exception as e:
-                    logger.error(f"Detection processing error: {e}")
-                    continue
+    last_time = time.time()
+    target_id = None
+    target_lost_frames = 0
+    last_target_position = None
+    hover_mode = False
 
-                # Update tracking
-                try:
-                    tracks = deepsort.update_tracks(detections, frame=frame)
-                except Exception as e:
-                    logger.error(f"DeepSORT update error: {e}")
-                    continue
+    try:
+        while True:
+            current_time = time.time()
+            if current_time - last_time < 1 / MAX_FPS:
+                continue
+            last_time = current_time
 
-                # Process each track
-                safe_tracks_keypoints = safe_zip_tracks_keypoints(tracks, keypoints_all)
-
-                for track, keypoints in safe_tracks_keypoints:
-                    try:
-                        if not track.is_confirmed():
-                            continue
-                            
-                        tid = track.track_id
-                        
-                        # Get and validate bounding box
-                        try:
-                            x1, y1, x2, y2 = map(int, track.to_ltrb())
-                            x1, y1, x2, y2 = validate_bounding_box(x1, y1, x2, y2, frame_w, frame_h)
-                            
-                            if x1 is None:  # Invalid bounding box
-                                continue
-                                
-                        except Exception as e:
-                            logger.error(f"Bounding box processing error: {e}")
-                            continue
-
-                        # Extract histogram
-                        hist = extract_histogram(frame, (x1, y1, x2, y2))
-                        if hist is None:
-                            continue
-
-                        # Match with appearance database
-                        matched_id = match_histogram(hist, appearance_db)
-                        if matched_id is not None and tid not in id_mapping:
-                            id_mapping[tid] = matched_id
-                            logger.info(f"Re-ID: Matched Track {tid} to Previous ID {matched_id}")
-
-                        # Update appearance database
-                        if tid not in appearance_db:
-                            appearance_db[tid] = hist
-                            manage_appearance_db()  # Prevent memory leaks
-
-                        # Draw keypoints
-                        try:
-                            for x, y in keypoints:
-                                # Fix NumPy deprecation warning
-                                x_val = float(x) if hasattr(x, '__float__') else x
-                                y_val = float(y) if hasattr(y, '__float__') else y
-                                
-                                if not np.isnan(x_val) and not np.isnan(y_val):
-                                    cv2.circle(frame, (int(x_val), int(y_val)), 3, (0, 0, 255), -1)
-                        except Exception as e:
-                            logger.warning(f"Keypoint drawing error: {e}")
-
-                        # Check for gesture
-                        if tid not in crossed_ids and is_crossed(keypoints):
-                            logger.info(f"Gesture: Crossed Hands Detected | ID: {tid}")
-                            crossed_ids.add(tid)
-                            if not following:
-                                # Reset tracking state
-                                appearance_db.clear()
-                                crossed_ids.clear()
-                                id_mapping.clear()
-                                following = True
-                                target_id = tid
-                                ai_controller.reset_control_state()
-                                logger.info(f"Now following person with ID: {tid}")
-
-                    except Exception as e:
-                        logger.error(f"Track processing error: {e}")
-                        continue
-
-                # Draw tracking information
-                for track in tracks:
-                    try:
-                        if not track.is_confirmed():
-                            continue
-                        tid = track.track_id
-                        mapped_id = id_mapping.get(tid, tid)
-                        x1, y1, x2, y2 = map(int, track.to_ltrb())
-                        color = (0, 0, 255) if tid in crossed_ids else (0, 255, 0)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(frame, f"ID:{mapped_id}", (x1, y1 - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                    except Exception as e:
-                        logger.warning(f"Drawing error: {e}")
-                        continue
-
-                # Handle target following with safety checks
-                if following and target_id is not None:
-                    try:
-                        target_track = next((trk for trk in tracks 
-                                           if trk.is_confirmed() and trk.track_id == target_id), None)
-                        if target_track:
-                            # Reset target lost counter when target is found
-                            ai_controller.target_lost_count = 0
-                            sx, sy, sz, syaw = ai_controller.track_target(target_track)
-                            logger.info(f"AI Action: Moving | X: {sx}, Y: {sy}, Z: {sz}, YAW: {syaw}")
-                        else:
-                            # Target lost - update counter and check if should stop following
-                            ai_controller.update_target_lost_count()
-                            if ai_controller.is_target_lost():
-                                logger.warning("Target lost for too long, stopping follow mode")
-                                following = False
-                                target_id = None
-                                ai_controller.hover()
-                            else:
-                                logger.warning("Target temporarily lost, hovering...")
-                                ai_controller.hover()
-                    except Exception as e:
-                        logger.error(f"Target following error: {e}")
-                        ai_controller.hover()
-                else:
-                    ai_controller.hover()
-
-                # Display frame
-                try:
-                    cv2.imshow("Pose + DeepSORT + ReID + Gesture", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        logger.info("Quitting...")
-                        break
-                except Exception as e:
-                    logger.error(f"Display error: {e}")
-
-            except Exception as e:
-                logger.error(f"Main loop error: {e}")
-                time.sleep(0.1)
+            frame = cap.frame
+            if frame is None:
+                time.sleep(0.05)
                 continue
 
+            # --- Preprocess frame for YOLO ---
+            frame_resized = cv2.resize(frame, (640, 480))
+            # If your model expects RGB, uncomment the next line:
+            frame_resized = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+
+            # --- Run detection ---
+            try:
+                results = pose_model(frame_resized, stream=False)[0]
+            except Exception as e:
+                print(f"Detection error: {e}")
+                continue
+
+            # --- Find the largest person (by area) ---
+            bboxes = []
+            person_keypoints = []
+            max_area = 0
+            target_bbox = None
+            for box, kpts in zip(results.boxes.xyxy.tolist(), results.keypoints):
+                x1, y1, x2, y2 = map(int, box)
+                area = (x2 - x1) * (y2 - y1)
+                if area > max_area:
+                    max_area = area
+                    target_bbox = (x1, y1, x2, y2)
+                    target_kpts = kpts
+                bboxes.append(([x1, y1, x2 - x1, y2 - y1], 1.0, 'person'))
+                person_keypoints.append(kpts)
+
+            if target_bbox is None:
+                print("No person detected.")
+                tello.send_rc_control(0, 0, 0, 0)
+                continue
+
+            # --- Tracking (optional, for robustness) ---
+            tracks = tracker.update_tracks(bboxes, frame=frame_resized)
+            # Find the track that matches the largest person
+            target_track = None
+            for track in tracks:
+                if track.is_confirmed():
+                    x1, y1, x2, y2 = map(int, track.to_ltrb())
+                    if (x1, y1, x2, y2) == target_bbox:
+                        target_track = track
+                        break
+
+            # --- Calculate control ---
+            x1, y1, x2, y2 = target_bbox
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            w, h = 640, 480  # frame_resized shape
+            area = (x2 - x1) * (y2 - y1) / (w * h)
+
+            # Center errors
+            dx = cx - w // 2
+            dy = cy - h // 2
+            area_error = TARGET_AREA - area
+
+            # Thresholds
+            min_yaw = 5
+            min_fb = 8
+            min_ud = 5
+
+            # Yaw (left/right rotation)
+            yaw = 0
+            if abs(dx) > DEADZONE_PIX:
+                yaw = int(np.clip(KP_YAW * dx / (w // 2) * MAX_SPEED, -MAX_SPEED, MAX_SPEED))
+                if abs(yaw) < min_yaw:
+                    yaw = min_yaw if yaw > 0 else -min_yaw
+
+            # Forward/backward
+            fb = 0
+            if abs(area_error) > AREA_THRESHOLD:
+                fb = int(np.clip(KP_FB * area_error * MAX_SPEED * 3, -MAX_SPEED, MAX_SPEED))
+                if abs(fb) < min_fb:
+                    fb = min_fb if fb > 0 else -min_fb
+
+            # Up/down
+            ud = 0
+            if abs(dy) > DEADZONE_PIX:
+                ud = int(np.clip(KP_UD * dy / (h // 2) * MAX_SPEED, -MAX_SPEED, MAX_SPEED))
+                if abs(ud) < min_ud:
+                    ud = min_ud if ud > 0 else -min_ud
+
+            # Left/right (optional, usually not needed if yaw is used)
+            lr = 0
+
+            # --- Send control ---
+            tello.send_rc_control(lr, fb, ud, yaw)
+            print(f"Controls: LR={lr}, FB={fb}, UD={ud}, Yaw={yaw}, Area={area:.3f}, AreaErr={area_error:.3f}, Center=({cx},{cy})")
+
+            # --- Draw for debug ---
+            cv2.rectangle(frame_resized, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.circle(frame_resized, (cx, cy), 5, (0, 0, 255), -1)
+            cv2.imshow('Tello Person Follow', frame_resized)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
     except Exception as e:
-        logger.error(f"Critical error: {e}")
-
+        print(f"Main loop error: {e}")
     finally:
-        # Cleanup
-        logger.info("Cleaning up...")
-        
-        if grabber:
-            grabber.stop()
-            grabber.join(timeout=5)
-            
-        if tello:
-            try:
-                tello.streamoff()
-                battery = tello.get_battery()
-                logger.info(f"Battery after flight: {battery}%")
-            except Exception as e:
-                logger.error(f"Error getting final battery: {e}")
-                
-            try:
-                logger.info("Landing drone...")
-                tello.land()
-            except Exception as e:
-                logger.error(f"Landing error: {e}")
-                
-            try:
-                tello.end()
-            except Exception as e:
-                logger.error(f"Drone disconnect error: {e}")
-
+        print("Cleaning up...")
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+            time.sleep(1)
+            tello.land()
+            time.sleep(3)
+            tello.streamoff()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
-        
-        # Clear tracking data
-        appearance_db.clear()
-        crossed_ids.clear()
-        id_mapping.clear()
-        
-        # Performance summary=
-        logger.info("\n" + "="*50)
-        logger.info("PERFORMANCE SUMMARY")
-        logger.info("="*50)
-        if 'ai_controller' in locals():
-            ai_controller.monitor_performance()
-        logger.info("="*50)
-        logger.info("All tracking data cleared. Program ended.")
+        time.sleep(1)
+
+# ----------------------------
+# Utility IOU
+# ----------------------------
+def compute_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+    return iou
 
 if __name__ == '__main__':
     main()

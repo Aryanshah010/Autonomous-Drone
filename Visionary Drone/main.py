@@ -10,16 +10,16 @@ import time
 # ----------------------------
 POSE_MODEL = '/Users/aryanshah/Developer/Autonomous-Drone/Visionary Drone/models/yolo11m-pose.pt'
 MAX_FPS = 30
-TARGET_AREA = 0.12  # Reduced target area for better distance control
-AREA_THRESHOLD = 0.01  # Reduced threshold for more sensitive response
+TARGET_AREA = 0.19  # Increased for closer following
+AREA_THRESHOLD = 0.005  # More sensitive
 DEADZONE_PIX = 25
 MAX_SPEED = 50
 
 # PID Gains - Adjusted for better forward/backward control
-KP_YAW = 0.6
-KP_FB = 1.5   # Increased for more responsive forward/backward
-KP_UD = 0.5
-KP_LR = 0.6
+KP_YAW = 0.9
+KP_FB = 2  # Increased for more responsive forward/backward
+KP_UD = 0.8
+KP_LR = 0.9
 
 # Tracking parameters
 MAX_LOST_FRAMES = 60
@@ -138,7 +138,6 @@ def initialize_drone_and_models():
     print("Initializing drone connection...")
     tello = Tello()
     tello.connect()
-    time.sleep(1)
     
     battery = tello.get_battery()
     print(f"Battery: {battery}%")
@@ -149,7 +148,7 @@ def initialize_drone_and_models():
     
     print("Starting video stream...")
     tello.streamon()
-    time.sleep(2)
+    time.sleep(0.5)
     
     cap = tello.get_frame_read()
     time.sleep(1)
@@ -170,7 +169,7 @@ def initialize_drone_and_models():
     print("Loading YOLO pose model...")
     try:
         pose_model = YOLO(POSE_MODEL)
-        time.sleep(1)
+        time.sleep(0.5)
         print("YOLO model loaded successfully")
     except Exception as e:
         print(f"Failed to load YOLO model: {e}")
@@ -253,7 +252,6 @@ def main():
 
             # --- Preprocess frame for YOLO ---
             frame_resized = cv2.resize(frame, (640, 480))
-            # If your model expects RGB, uncomment the next line:
             frame_resized = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
 
             # --- Run detection ---
@@ -296,14 +294,20 @@ def main():
 
             # --- Calculate control ---
             x1, y1, x2, y2 = target_bbox
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             w, h = 640, 480  # frame_resized shape
-            area = (x2 - x1) * (y2 - y1) / (w * h)
 
-            # Center errors
-            dx = cx - w // 2
-            dy = cy - h // 2
+            # --- Updated: Use bottom of bbox for vertical control ---
+            target_feet_y = int(h * 0.85)  # Target feet position at 85% of frame height
+            feet_y = y2  # Bottom of bounding box
+            dy = feet_y - target_feet_y
+
+            # --- Updated: Forward/backward control with new thresholds ---
+            area = (x2 - x1) * (y2 - y1) / (w * h)
             area_error = TARGET_AREA - area
+
+            # Center errors (for yaw)
+            cx = (x1 + x2) // 2
+            dx = cx - w // 2
 
             # Thresholds
             min_yaw = 5
@@ -324,23 +328,27 @@ def main():
                 if abs(fb) < min_fb:
                     fb = min_fb if fb > 0 else -min_fb
 
-            # Up/down
+            # Up/down (now using feet position, only move up automatically)
             ud = 0
-            if abs(dy) > DEADZONE_PIX:
-                ud = int(np.clip(KP_UD * dy / (h // 2) * MAX_SPEED, -MAX_SPEED, MAX_SPEED))
-                if abs(ud) < min_ud:
-                    ud = min_ud if ud > 0 else -min_ud
+            if dy > DEADZONE_PIX:
+                # Only move up if feet are below the target position
+                ud = int(np.clip(KP_UD * dy / (h // 2) * MAX_SPEED, 0, MAX_SPEED))
+                if ud < min_ud:
+                    ud = min_ud
+            elif dy < -DEADZONE_PIX:
+                # Don't move down automatically
+                ud = 0
 
             # Left/right (optional, usually not needed if yaw is used)
             lr = 0
 
             # --- Send control ---
             tello.send_rc_control(lr, fb, ud, yaw)
-            print(f"Controls: LR={lr}, FB={fb}, UD={ud}, Yaw={yaw}, Area={area:.3f}, AreaErr={area_error:.3f}, Center=({cx},{cy})")
+            print(f"Controls: LR={lr}, FB={fb}, UD={ud}, Yaw={yaw}, Area={area:.3f}, AreaErr={area_error:.3f}, FeetY={feet_y}, TargetFeetY={target_feet_y}")
 
             # --- Draw for debug ---
             cv2.rectangle(frame_resized, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(frame_resized, (cx, cy), 5, (0, 0, 255), -1)
+            cv2.circle(frame_resized, ((x1 + x2) // 2, (y1 + y2) // 2), 5, (0, 0, 255), -1)
             cv2.imshow('Tello Person Follow', frame_resized)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break

@@ -13,12 +13,12 @@ MAX_FPS = 30
 TARGET_AREA = 0.19  # Increased for closer following
 AREA_THRESHOLD = 0.005  # More sensitive
 DEADZONE_PIX = 25
-MAX_SPEED = 50
+MAX_SPEED = 65
 
 # PID Gains - Adjusted for better forward/backward control
-KP_YAW = 0.9
-KP_FB = 2  # Increased for more responsive forward/backward
-KP_UD = 0.8
+KP_YAW = 0.6 # Lowered from 0.9 to reduce turbulence
+KP_FB = 1.8   # Increased from 0.7 for faster following
+KP_UD = 0.3
 KP_LR = 0.9
 
 # Tracking parameters
@@ -237,6 +237,11 @@ def main():
     target_lost_frames = 0
     last_target_position = None
     hover_mode = False
+    
+    # --- For adaptive speed ---
+    last_cx = None
+    last_velocity_time = None
+    velocity_smooth = 0
 
     try:
         while True:
@@ -297,7 +302,7 @@ def main():
             w, h = 640, 480  # frame_resized shape
 
             # --- Updated: Use bottom of bbox for vertical control ---
-            target_feet_y = int(h * 0.85)  # Target feet position at 85% of frame height
+            target_feet_y = int(h * 0.95)  # Show full body, feet near bottom
             feet_y = y2  # Bottom of bounding box
             dy = feet_y - target_feet_y
 
@@ -309,10 +314,53 @@ def main():
             cx = (x1 + x2) // 2
             dx = cx - w // 2
 
+            # --- Adaptive speed: estimate subject velocity ---
+            current_velocity_time = time.time()
+            if last_cx is not None and last_velocity_time is not None:
+                dt = current_velocity_time - last_velocity_time
+                if dt > 0:
+                    velocity = (cx - last_cx) / dt  # pixels per second
+                    velocity_smooth = 0.8 * velocity_smooth + 0.2 * velocity
+                else:
+                    velocity = 0
+            else:
+                velocity = 0
+            last_cx = cx
+            last_velocity_time = current_velocity_time
+
+            # Use velocity to scale FB (forward/backward) command
+            # If subject moves fast, drone follows faster (scale between 1x and 2.5x)
+            velocity_factor = min(max(abs(velocity_smooth) / 100, 1), 2.5)
+
             # Thresholds
-            min_yaw = 5
-            min_fb = 8
+            min_yaw = 10   # Increased from 5 to reduce jitter
+            min_fb = 8     # (can keep as is, or try 10 for more punch)
             min_ud = 5
+
+            # --- Deadzone for area and feet position ---
+            area_deadzone = 0.015  # Only move if area error is > 0.015 (tune as needed)
+            feet_deadzone = 20     # Only move if feet error is > 20 pixels (tune as needed)
+
+            # Forward/backward
+            fb = 0
+            if abs(area_error) > area_deadzone:
+                fb = int(np.clip(KP_FB * area_error * MAX_SPEED * 3 * velocity_factor, -MAX_SPEED, MAX_SPEED))
+                if abs(fb) < min_fb:
+                    fb = min_fb if fb > 0 else -min_fb
+
+            # Up/down (now using feet position, only move up automatically)
+            ud = 0
+            if dy > feet_deadzone:
+                ud = int(np.clip(KP_UD * dy / (h // 2) * MAX_SPEED, 0, MAX_SPEED))
+                if ud < min_ud:
+                    ud = min_ud
+            elif dy < -feet_deadzone:
+                ud = 0
+
+            # If both errors are small, don't move
+            if abs(area_error) <= area_deadzone and abs(dy) <= feet_deadzone:
+                fb = 0
+                ud = 0
 
             # Yaw (left/right rotation)
             yaw = 0
@@ -320,24 +368,6 @@ def main():
                 yaw = int(np.clip(KP_YAW * dx / (w // 2) * MAX_SPEED, -MAX_SPEED, MAX_SPEED))
                 if abs(yaw) < min_yaw:
                     yaw = min_yaw if yaw > 0 else -min_yaw
-
-            # Forward/backward
-            fb = 0
-            if abs(area_error) > AREA_THRESHOLD:
-                fb = int(np.clip(KP_FB * area_error * MAX_SPEED * 3, -MAX_SPEED, MAX_SPEED))
-                if abs(fb) < min_fb:
-                    fb = min_fb if fb > 0 else -min_fb
-
-            # Up/down (now using feet position, only move up automatically)
-            ud = 0
-            if dy > DEADZONE_PIX:
-                # Only move up if feet are below the target position
-                ud = int(np.clip(KP_UD * dy / (h // 2) * MAX_SPEED, 0, MAX_SPEED))
-                if ud < min_ud:
-                    ud = min_ud
-            elif dy < -DEADZONE_PIX:
-                # Don't move down automatically
-                ud = 0
 
             # Left/right (optional, usually not needed if yaw is used)
             lr = 0
@@ -361,7 +391,7 @@ def main():
             tello.send_rc_control(0, 0, 0, 0)
             time.sleep(1)
             tello.land()
-            time.sleep(3)
+            time.sleep(1)
             tello.streamoff()
         except Exception:
             pass

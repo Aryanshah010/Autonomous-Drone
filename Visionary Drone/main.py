@@ -18,11 +18,11 @@ MAX_SPEED = 65
 # PID Gains - Adjusted for better forward/backward control
 KP_YAW = 0.6 # Lowered from 0.9 to reduce turbulence
 KP_FB = 1.8   # Increased from 0.7 for faster following
-KP_UD = 0.3
+KP_UD = 0.4
 KP_LR = 0.9
 
 # Tracking parameters
-MAX_LOST_FRAMES = 60
+MAX_LOST_FRAMES = 120
 REACQUISITION_DISTANCE = 400
 HEADING_HISTORY_SIZE = 5
 
@@ -211,6 +211,35 @@ def test_detection_system(pose_model, cap, duration=3):
     print(f"Detection test complete - Rate: {detection_rate:.2f}")
     return detection_rate > 0.1
 
+
+# ----------------------------
+# Safe Landing Check
+# ----------------------------
+def is_safe_landing_zone(frame):
+    """
+    Analyze the bottom region of the frame to determine if it's safe for landing.
+    Criteria:
+    - Sufficient brightness (not too dark)
+    - Low texture variation (flat surface)
+    - No large dark spots (obstacles/shadows)
+    """
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        landing_region = gray[int(h*0.75):, int(w*0.25):int(w*0.75)]
+
+        mean_brightness = np.mean(landing_region)
+        std_dev = np.std(landing_region)
+
+        if mean_brightness > 80 and std_dev < 25:
+            return True
+        else:
+            return False
+    except Exception as e:
+        print(f"Landing zone detection error: {e}")
+        return False
+
+
 def main():
     tello, cap, pose_model, tracker = initialize_drone_and_models()
     if tello is None:
@@ -390,14 +419,37 @@ def main():
         try:
             tello.send_rc_control(0, 0, 0, 0)
             time.sleep(1)
-            tello.land()
+
+            print("Scanning for safe landing area...")
+            safe_landed = False
+            for _ in range(60):  
+                frame = cap.frame
+                if frame is not None:
+                    if is_safe_landing_zone(frame):
+                        print("Safe landing zone detected.")
+                        tello.land()
+                        safe_landed = True
+                        break
+                    else:
+                        print("Unsafe landing zone, retrying...")
+                time.sleep(0.1)
+
+            if not safe_landed:
+                print("Could not find safe landing area. Hovering before forced landing...")
+                for _ in range(50):  # Hover for ~5 seconds
+                    tello.send_rc_control(0, 0, 0, 0)
+                    time.sleep(0.1)
+                print("Landing anyway after hover.")
+                tello.land()
+
             time.sleep(1)
             tello.streamoff()
-        except Exception:
-            pass
-        cv2.destroyAllWindows()
-        time.sleep(1)
-
+        except Exception as e:
+            print(f"Landing error: {e}")
+        finally:
+            cv2.destroyAllWindows()
+            time.sleep(1)
+    
 # ----------------------------
 # Utility IOU
 # ----------------------------
